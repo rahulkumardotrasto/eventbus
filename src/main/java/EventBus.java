@@ -1,8 +1,8 @@
-import models.Subscription;
-import models.Timestamp;
+import exception.RetryLimitExceededException;
 import models.*;
 import retry.RetryAlgorithm;
 import utils.KeyedExecutor;
+import utils.Timer;
 
 import java.util.*;
 import java.util.concurrent.CompletionStage;
@@ -21,8 +21,10 @@ public class EventBus {
     private final EventBus deadLetterQueue;
     private final Timer timer;
 
-    private EventBus(final int threads, final RetryAlgorithm<Event, Void> retryAlgorithm,
-                     final EventBus deadLetterQueue, final Timer timer){
+    public EventBus(final int threads,
+                    final RetryAlgorithm<Event, Void> retryAlgorithm,
+                    final EventBus deadLetterQueue,
+                    final Timer timer) {
         this.retryAlgorithm = retryAlgorithm;
         this.deadLetterQueue = deadLetterQueue;
         this.timer = timer;
@@ -34,11 +36,11 @@ public class EventBus {
         this.eventIndex = new ConcurrentHashMap<>();
     }
 
-    public CompletionStage<Void> publish(Topic topic, Event event){
+    public CompletionStage<Void> publish(Topic topic, Event event) {
         return executor.submit(topic.getName(), () -> addEventToBus(topic, event));
     }
 
-    public void addEventToBus(Topic topic, Event event) {
+    private void addEventToBus(Topic topic, Event event) {
         final Index currentIndex = new Index(buses.get(topic).size());
         timestampIndex.get(topic).put(event.getTimestamp(), currentIndex);
         eventIndex.get(topic).put(event.getId(), currentIndex);
@@ -49,11 +51,11 @@ public class EventBus {
                 .forEach(subscription -> push(event, subscription));
     }
 
-    public CompletionStage<Event> poll(Topic topic, EntityID subscriber){
+    public CompletionStage<Event> poll(Topic topic, EntityID subscriber) {
         return executor.get(topic.getName() + subscriber.getId(), () -> {
             final Index index = subscriberIndexes.get(topic).get(subscriber);
             try {
-                final Event event = buses.get(topic).put(subscriber, index.increment());
+                final Event event = buses.get(topic).get(index.getVal());
                 subscriberIndexes.get(topic).put(subscriber, index.increment());
                 return event;
             } catch (IndexOutOfBoundsException exception) {
@@ -63,11 +65,63 @@ public class EventBus {
     }
 
     private void push(Event event, Subscription subscription) {
-
+        executor.submit(subscription.getTopicId().getName() + subscription.getSubscriberId(),
+                () -> {
+                    try {
+                        retryAlgorithm.attempt(subscription.handler(), event, 0);
+                    } catch (RetryLimitExceededException e) {
+                        if (deadLetterQueue != null) {
+                            deadLetterQueue.publish(subscription.getTopicId(),
+                                    new FailureEvent(event, e, timer.getTime()));
+                        } else {
+                            e.printStackTrace();
+                        }
+                    }
+                });
     }
 
+    public void registerTopic(Topic topic) {
+        buses.put(topic, new CopyOnWriteArrayList<>());
+        subscriptions.put(topic, Collections.newSetFromMap(new ConcurrentHashMap<>()));
+        subscriberIndexes.put(topic, new ConcurrentHashMap<>());
+        timestampIndex.put(topic, new ConcurrentSkipListMap<>());
+        eventIndex.put(topic, new ConcurrentHashMap<>());
+    }
 
+    public CompletionStage<Void> subscribe(final Subscription subscription) {
+        return executor.submit(subscription.getTopicId().getName(), () -> {
+            final Topic topicId = subscription.getTopicId();
+            subscriptions.get(topicId).add(subscription);
+            subscriberIndexes.get(topicId).put(subscription.getSubscriberId(),
+                    new Index(buses.get(topicId).size()));
+        });
+    }
 
+    public CompletionStage<Void> setIndexAfterTimestamp(Topic topic, EntityID subscriber, Timestamp timestamp) {
+        return executor.submit(topic.getName() + subscriber.getId(), () -> {
+            final Map.Entry<Timestamp, Index> entry = timestampIndex.get(topic).higherEntry(timestamp);
+            if (entry == null) {
+                subscriberIndexes.get(topic).put(subscriber, new Index(buses.get(topic).size()));
+            } else {
+                final Index indexLessThanEquals = entry.getValue();
+                subscriberIndexes.get(topic).put(subscriber, indexLessThanEquals);
+            }
+        });
+    }
 
+    public CompletionStage<Void> setIndexAfterEvent(Topic topic, EntityID subscriber, EventID eventId) {
+        return executor.submit(topic.getName() + subscriber.getId(), () -> {
+            final Index eIndex = eventIndex.get(topic).get(eventId);
+            subscriberIndexes.get(topic).put(subscriber, eIndex.increment());
+        });
+    }
 
+    public CompletionStage<Event> getEvent(Topic topic, EventID eventId) {
+        return executor.get(topic.getName(), () -> {
+            Index index = eventIndex.get(topic).get(eventId);
+            return buses.get(topic).get(index.getVal());
+        });
+    }
 }
+
+

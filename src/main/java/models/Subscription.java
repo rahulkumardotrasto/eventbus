@@ -22,7 +22,7 @@ public class Subscription {
         this.handler = handler;
     }
 
-    public EntityID getSubscriptionId() {
+    public EntityID getSubscriberId() {
         return subscriptionId;
     }
 
@@ -30,7 +30,7 @@ public class Subscription {
         return topicId;
     }
 
-    public Function<Event, Void> getHandler() {
+    public Function<Event, Void> handler() {
         return handler;
     }
 
