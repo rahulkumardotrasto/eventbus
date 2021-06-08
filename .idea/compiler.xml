@@ -9,5 +9,8 @@
         <module name="eventbus" />
       </profile>
     </annotationProcessing>
+    <bytecodeTargetLevel>
+      <module name="eventbus" target="11" />
+    </bytecodeTargetLevel>
   </component>
 </project>
